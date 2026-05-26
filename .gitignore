@@ -1,26 +1,6 @@
-new_env
-.claude
-
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
+*.pyc
 venv/
-env/
-*.egg-info/
-dist/
 build/
-
-# PyInstaller
+dist/
 *.spec
-*.app
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-*.dmg
