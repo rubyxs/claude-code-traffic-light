@@ -3,14 +3,16 @@
 Codex menu bar traffic light for macOS.
 
 Status mapping:
-- Green: Codex is actively working on the selected project.
-- Yellow: Codex likely needs approval for an escalated command.
-- Red: no active turn was detected for the selected project.
+- Animated red/yellow/green sweep: Codex is thinking.
+- Steady yellow: Codex is actively working on the selected project.
+- Flashing red/yellow: Codex likely needs approval for an escalated command.
+- Green: the selected project's latest turn is complete.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -37,7 +39,7 @@ POLL_INTERVAL = 0.4
 BLINK_INTERVAL = 0.5
 MENU_REFRESH_INTERVAL = 3.0
 ACTIVE_GRACE_MS = 20_000
-APPROVAL_GRACE_MS = 120_000
+FRESH_ACTIVITY_MS = 8_000
 LOG_SCAN_LIMIT = 250
 
 ICON_SCALE = 1.5
@@ -183,9 +185,161 @@ def get_project_info(cwd: str | None) -> ProjectInfo | None:
 def _find_latest_event_id(messages: list[str], marker: str) -> int:
     for message in messages:
         if marker in message:
-            prefix, _, _ = message.partition("|")
             try:
-                return int(prefix)
+                return int(message.split("|", 1)[0])
+            except ValueError:
+                return 0
+    return 0
+
+
+EVENT_TYPE_PATTERNS = (
+    re.compile(r'websocket event: \{"type":"([^"]+)"'),
+    re.compile(r'Received message \{"type":"([^"]+)"'),
+)
+
+
+def _find_latest_response_event_type(messages: list[str]) -> tuple[str | None, int]:
+    for message in messages:
+        for pattern in EVENT_TYPE_PATTERNS:
+            match = pattern.search(message)
+            if match:
+                try:
+                    return match.group(1), int(message.split("|", 1)[0])
+                except ValueError:
+                    return match.group(1), 0
+    return None, 0
+
+
+APPROVAL_SANDBOX_MARKERS = (
+    '"sandbox_permissions":"require_escalated"',
+    '"sandbox_permissions": "require_escalated"',
+)
+
+APPROVAL_JUSTIFICATION_MARKERS = (
+    '"justification":"',
+    '"justification": "',
+)
+
+STALL_TARGETS = {
+    "codex_client::transport",
+    "codex_api::sse::responses",
+    "codex_api::endpoint::responses_websocket",
+}
+
+STALL_MARKERS = (
+    "reconnecting",
+    "stream error",
+    "connection error",
+    "network error",
+    "failed to connect",
+)
+
+STALL_EXCLUDE_MARKERS = (
+    "stream.poll_next",
+    "websocketstream.with_context",
+    "stream.with_context poll_next -> read()",
+    "wouldblock",
+    "stream_request{",
+    'transport="responses_websocket"',
+    'transport="responses_http"',
+    "websocket request:",
+)
+
+
+def _is_approval_toolcall(body: str) -> bool:
+    return (
+        "ToolCall:" in body
+        and any(marker in body for marker in APPROVAL_SANDBOX_MARKERS)
+        and any(marker in body for marker in APPROVAL_JUSTIFICATION_MARKERS)
+    )
+
+
+def _find_latest_exact_approval_event_id(messages: list[str]) -> int:
+    for message in messages:
+        parts = message.split("|", 2)
+        if len(parts) != 3:
+            continue
+        _, target, body = parts
+        if target != "codex_core::stream_events_utils":
+            continue
+        if _is_approval_toolcall(body):
+            try:
+                return int(parts[0])
+            except ValueError:
+                return 0
+    return 0
+
+
+def _find_latest_approval_decision_event_id(messages: list[str]) -> int:
+    for message in messages:
+        parts = message.split("|", 2)
+        if len(parts) != 3:
+            continue
+        id_part, target, body = parts
+        if target != "codex_core::session::handlers":
+            continue
+        if "ExecApproval" not in body or "decision:" not in body:
+            continue
+        try:
+            return int(id_part)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _find_latest_stream_toolcall_event(messages: list[str]) -> tuple[int, bool]:
+    for message in messages:
+        parts = message.split("|", 2)
+        if len(parts) != 3:
+            continue
+        id_part, target, body = parts
+        if target != "codex_core::stream_events_utils":
+            continue
+        if "ToolCall:" not in body:
+            continue
+        try:
+            event_id = int(id_part)
+        except ValueError:
+            event_id = 0
+        is_approval = _is_approval_toolcall(body)
+        return event_id, is_approval
+    return 0, False
+
+
+def _find_latest_stalled_event_id(messages: list[str]) -> int:
+    for message in messages:
+        parts = message.split("|", 2)
+        if len(parts) != 3:
+            continue
+        id_part, target, body = parts
+        body_lower = body.lower()
+        if any(marker in body_lower for marker in STALL_EXCLUDE_MARKERS):
+            continue
+        if target in STALL_TARGETS and any(marker in body_lower for marker in STALL_MARKERS):
+            try:
+                return int(id_part)
+            except ValueError:
+                return 0
+    return 0
+
+
+def _find_latest_tool_event_id(messages: list[str]) -> int:
+    tool_markers = (
+        '"type":"response.output_item.done","item":{"id":"fc_',
+        '"type":"response.function_call_arguments.done"',
+        'tool_name="exec_command"',
+        'tool_name="apply_patch"',
+        'ToolCall:',
+    )
+    for message in messages:
+        parts = message.split("|", 2)
+        if len(parts) == 3:
+            _, target, body = parts
+            if target == "codex_core::stream_events_utils" and _is_approval_toolcall(body):
+                continue
+        if any(marker in message for marker in tool_markers):
+            try:
+                return int(message.split("|", 1)[0])
             except ValueError:
                 return 0
     return 0
@@ -198,7 +352,7 @@ def _load_recent_log_messages(thread_id: str) -> list[str]:
     with connect_readonly(LOG_DB_PATH) as conn:
         rows = conn.execute(
             """
-            SELECT id, COALESCE(feedback_log_body, '')
+            SELECT id, target, COALESCE(feedback_log_body, '')
             FROM logs
             WHERE thread_id = ?
             ORDER BY id DESC
@@ -207,34 +361,70 @@ def _load_recent_log_messages(thread_id: str) -> list[str]:
             (thread_id, LOG_SCAN_LIMIT),
         ).fetchall()
 
-    return [f"{row[0]}|{row[1]}" for row in rows]
+    return [f"{row[0]}|{row[1]}|{row[2]}" for row in rows]
 
 
 def infer_state(project: ProjectInfo | None) -> StateSnapshot:
     if project is None:
-        return StateSnapshot("red", "No Codex project found", 0)
+        return StateSnapshot("done", "No Codex project found", 0)
 
     messages = _load_recent_log_messages(project.thread_id)
-    latest_created = _find_latest_event_id(messages, '"type":"response.created"')
-    latest_progress = _find_latest_event_id(messages, '"type":"response.in_progress"')
-    latest_completed = _find_latest_event_id(messages, '"type":"response.completed"')
-    latest_approval = _find_latest_event_id(messages, "require_escalated")
-    latest_activity = max(latest_created, latest_progress, latest_completed, latest_approval)
+    latest_event_type, latest_event_id = _find_latest_response_event_type(messages)
+    latest_approval = _find_latest_exact_approval_event_id(messages)
+    latest_approval_decision = _find_latest_approval_decision_event_id(messages)
+    latest_stream_toolcall_id, latest_stream_toolcall_is_approval = _find_latest_stream_toolcall_event(messages)
+    latest_stalled = _find_latest_stalled_event_id(messages)
+    latest_tool = _find_latest_tool_event_id(messages)
     age_ms = max(0, now_ms() - project.updated_at_ms)
+    is_fresh_activity = age_ms <= FRESH_ACTIVITY_MS
+    is_recently_active = age_ms <= ACTIVE_GRACE_MS
+    if latest_approval > latest_approval_decision:
+        return StateSnapshot("approval", "Waiting for confirmation", project.updated_at_ms)
 
-    if (
-        latest_approval > max(latest_created, latest_progress, latest_completed)
-        and age_ms <= APPROVAL_GRACE_MS
-    ):
-        return StateSnapshot("yellow", "Waiting for approval", project.updated_at_ms)
+    if latest_event_type == "response.completed" and latest_event_id >= max(latest_approval, latest_tool, latest_stream_toolcall_id, latest_stalled):
+        return StateSnapshot("done", "Development complete", project.updated_at_ms)
 
-    if max(latest_created, latest_progress) > latest_completed and age_ms <= ACTIVE_GRACE_MS:
-        return StateSnapshot("green", "Codex is actively working", project.updated_at_ms)
+    thinking_events = {
+        "response.created",
+        "response.in_progress",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+    }
+    working_events = {
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.added",
+    }
 
-    if latest_activity and age_ms <= ACTIVE_GRACE_MS and latest_completed == 0:
-        return StateSnapshot("green", "Recent Codex activity detected", project.updated_at_ms)
+    if latest_event_type in thinking_events | working_events and is_recently_active:
+        if is_fresh_activity:
+            return StateSnapshot("working", "Active development", project.updated_at_ms)
 
-    return StateSnapshot("red", "Idle or turn finished", project.updated_at_ms)
+        return StateSnapshot("thinking", "Thinking", project.updated_at_ms)
+
+    if latest_stream_toolcall_is_approval and latest_stream_toolcall_id > max(latest_event_id, latest_tool):
+        return StateSnapshot("approval", "Waiting for confirmation", project.updated_at_ms)
+
+    if latest_stalled > max(latest_event_id, latest_tool, latest_approval, latest_stream_toolcall_id) and not is_fresh_activity:
+        return StateSnapshot("stalled", "Connection or stream issue", project.updated_at_ms)
+
+    if latest_stream_toolcall_id > max(latest_event_id, latest_approval) and is_fresh_activity:
+        return StateSnapshot("working", "Active development", project.updated_at_ms)
+
+    if latest_tool and is_fresh_activity:
+        return StateSnapshot("working", "Active development", project.updated_at_ms)
+
+    if latest_event_id and is_recently_active:
+        return StateSnapshot("thinking", "Thinking", project.updated_at_ms)
+
+    if latest_approval > max(latest_event_id, latest_tool):
+        return StateSnapshot("approval", "Waiting for confirmation", project.updated_at_ms)
+
+    if project.updated_at_ms:
+        return StateSnapshot("thinking", "Thinking", project.updated_at_ms)
+
+    return StateSnapshot("done", "No Codex activity yet", project.updated_at_ms)
 
 
 def _make_color(red: int, green: int, blue: int, alpha: float = 1.0) -> NSColor:
@@ -252,7 +442,7 @@ def _draw_circle(rect, color: NSColor) -> None:
     path.fill()
 
 
-def render_status_icon(state: str, blink_on: bool) -> NSImage:
+def render_status_icon(state: str, animation_step: int) -> NSImage:
     image = NSImage.alloc().initWithSize_((ICON_WIDTH, ICON_HEIGHT))
     image.lockFocus()
 
@@ -300,7 +490,6 @@ def render_status_icon(state: str, blink_on: bool) -> NSImage:
     lamp_y = (ICON_HEIGHT - LAMP_DIAMETER) / 2.0
     glow_y = (ICON_HEIGHT - LAMP_GLOW_DIAMETER) / 2.0
     lamp_states = ["red", "yellow", "green"]
-    active_state = state if state != "yellow" or blink_on else None
     lamp_colors = {
         "red": _make_color(255, 90, 84, 0.92),
         "yellow": _make_color(245, 191, 72, 0.93),
@@ -313,6 +502,8 @@ def render_status_icon(state: str, blink_on: bool) -> NSImage:
     }
     off_outer = _make_color(90, 96, 106, 0.58)
     off_inner = _make_color(146, 152, 164, 0.28)
+    thinking_index = animation_step % 3
+    approval_flash_on = (animation_step % 2) == 0
 
     lamps_total_width = (LAMP_DIAMETER * 3) + (LAMP_SPACING * 2)
     first_lamp_x = housing_rect.origin.x + ((housing_rect.size.width - lamps_total_width) / 2.0)
@@ -326,7 +517,19 @@ def render_status_icon(state: str, blink_on: bool) -> NSImage:
             LAMP_GLOW_DIAMETER,
         )
 
-        if lamp_state == active_state:
+        lamp_on = False
+        if state == "thinking":
+            lamp_on = index == thinking_index
+        elif state == "working":
+            lamp_on = lamp_state == "yellow"
+        elif state == "approval":
+            lamp_on = lamp_state in ("red", "yellow") and approval_flash_on
+        elif state == "stalled":
+            lamp_on = lamp_state == "red"
+        elif state == "done":
+            lamp_on = lamp_state == "green"
+
+        if lamp_on:
             _draw_circle(glow_rect, lamp_glows[lamp_state])
             _draw_circle(lamp_rect, lamp_colors[lamp_state])
             _draw_circle(
@@ -349,8 +552,8 @@ def render_status_icon(state: str, blink_on: bool) -> NSImage:
 class TrafficLightApp(rumps.App):
     def __init__(self) -> None:
         super().__init__("Codex Traffic Light", title=None, quit_button="Quit")
-        self.state = "red"
-        self.blink_on = True
+        self.state = "done"
+        self.animation_step = 0
         self.selected_cwd = get_selected_project()
         self.last_projects: list[str] = []
         self.last_menu_build_time = 0.0
@@ -405,9 +608,11 @@ class TrafficLightApp(rumps.App):
 
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Legend", callback=None))
-        self.menu.add(rumps.MenuItem("🟢 Working"))
-        self.menu.add(rumps.MenuItem("🟡 Approval needed"))
-        self.menu.add(rumps.MenuItem("🔴 Idle / finished"))
+        self.menu.add(rumps.MenuItem("跑马灯 - Thinking"))
+        self.menu.add(rumps.MenuItem("🟡 - Active development"))
+        self.menu.add(rumps.MenuItem("🔴🟡 flashing - Confirmation needed"))
+        self.menu.add(rumps.MenuItem("🔴 - Connection or stream issue"))
+        self.menu.add(rumps.MenuItem("🟢 - Development complete"))
 
         self.last_projects = [project.cwd for project in projects]
         self.last_menu_build_time = time.time()
@@ -417,8 +622,8 @@ class TrafficLightApp(rumps.App):
             if sender.title == project.label:
                 self.selected_cwd = project.cwd
                 set_selected_project(project.cwd)
-                self.state = "red"
-                self.blink_on = True
+                self.state = "done"
+                self.animation_step = 0
                 self._build_menu()
                 self.update_display()
                 return
@@ -428,7 +633,7 @@ class TrafficLightApp(rumps.App):
         snapshot = infer_state(current)
         if snapshot.state != self.state:
             self.state = snapshot.state
-            self.blink_on = True
+            self.animation_step = 0
 
         now = time.time()
         projects = list_projects()
@@ -442,13 +647,13 @@ class TrafficLightApp(rumps.App):
         self.update_display()
 
     def blink(self, _sender) -> None:
-        self.blink_on = not self.blink_on
+        self.animation_step += 1
         self.update_display()
 
     def update_display(self) -> None:
         self.title = None
         self._icon = "__rendered__"
-        self._icon_nsimage = render_status_icon(self.state, self.blink_on)
+        self._icon_nsimage = render_status_icon(self.state, self.animation_step)
         try:
             self._nsapp.setStatusBarIcon()
         except AttributeError:

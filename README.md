@@ -9,17 +9,28 @@ It is adapted from the Claude version, but instead of modifying hooks it reads C
 
 ## Status mapping
 
-- `🟢` green: Codex is actively working on the selected project
-- `🟡` yellow blinking: Codex likely needs approval for an escalated command
-- `🔴` red: the project is idle or the latest turn has finished
+- animated `🔴 -> 🟡 -> 🟢`: Codex is thinking
+- steady `🟡`: Codex is actively working on the selected project
+- flashing `🔴🟡`: Codex likely needs approval for an escalated command
+- steady `🔴`: Codex likely hit a connection or stream issue
+- steady `🟢`: the selected project's latest turn is complete
 
 ## How it works
 
 The app watches the most recent non-archived Codex thread for each project path and infers state from recent log events:
 
-- `response.created` / `response.in_progress` -> active
-- recent `require_escalated` request with no newer response status -> approval needed
-- otherwise -> idle
+- unresolved `require_escalated` request -> approval needed
+- fresh activity within roughly 8 seconds -> working
+- recent but quieter in-progress activity within roughly 20 seconds -> thinking
+- explicit connection/stream failure markers in the logs -> steady red
+- explicit `response.completed` -> complete
+
+More specifically:
+
+- `🟢` only appears on explicit `response.completed`
+- approval keeps flashing until the logs show an explicit approval decision
+- quiet unresolved turns fall back to `thinking`, not `done`
+- the red error state is conservative and only triggers on stronger interruption markers such as reconnecting or stream/connection errors, not routine websocket noise
 
 This is heuristic because Codex does not currently expose the same hook system that the Claude version uses.
 
