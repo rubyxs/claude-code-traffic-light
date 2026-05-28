@@ -22,6 +22,7 @@ The app watches the most recent non-archived Codex thread for each project path 
 - unresolved `require_escalated` request -> approval needed
 - fresh activity within roughly 8 seconds -> working
 - recent but quieter in-progress activity within roughly 20 seconds -> thinking
+- `response.completed` must stay quiet for roughly 3 seconds before turning green
 - explicit connection/stream failure markers in the logs -> steady red
 - explicit `response.completed` -> complete
 

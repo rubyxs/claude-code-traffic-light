@@ -14,14 +14,16 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 import rumps
-from AppKit import NSBezierPath, NSColor, NSImage
+from AppKit import NSBezierPath, NSColor, NSImage, NSBeep
 from Foundation import NSMakeRect
 
 
@@ -34,12 +36,20 @@ STATE_DB_PATH = CODEX_HOME / "state_5.sqlite"
 LOG_DB_PATH = CODEX_HOME / "logs_2.sqlite"
 APP_DIR = CODEX_HOME / "traffic_light"
 SELECTED_FILE = APP_DIR / "selected_project"
+AUTO_SWITCH_FILE = APP_DIR / "auto_switch_when_done"
+APPROVAL_SOUND_PATH = Path("/System/Library/Sounds/Ping.aiff")
+DONE_SOUND_PATH = Path("/System/Library/Sounds/Glass.aiff")
 
 POLL_INTERVAL = 0.4
 BLINK_INTERVAL = 0.5
 MENU_REFRESH_INTERVAL = 3.0
 ACTIVE_GRACE_MS = 20_000
 FRESH_ACTIVITY_MS = 8_000
+COMPLETION_SETTLE_MS = 3_000
+AUTO_SWITCH_DONE_SECONDS = 600
+APPROVAL_SOUND_WINDOW_SECONDS = 10.0
+APPROVAL_SOUND_INTERVAL_SECONDS = 2.0
+SOUND_VOLUME = 1.5
 LOG_SCAN_LIMIT = 250
 
 ICON_SCALE = 1.5
@@ -73,6 +83,12 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def is_today_local(timestamp_ms: int) -> bool:
+    if timestamp_ms <= 0:
+        return False
+    return datetime.fromtimestamp(timestamp_ms / 1000).date() == datetime.now().date()
+
+
 def load_config_value() -> dict:
     config_path = CODEX_HOME / "config.toml"
     if not config_path.exists():
@@ -104,6 +120,19 @@ def get_selected_project() -> str | None:
 def set_selected_project(cwd: str) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     SELECTED_FILE.write_text(cwd, encoding="utf-8")
+
+
+def get_auto_switch_enabled() -> bool:
+    try:
+        value = AUTO_SWITCH_FILE.read_text(encoding="utf-8").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+    except Exception:
+        return False
+
+
+def set_auto_switch_enabled(enabled: bool) -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    AUTO_SWITCH_FILE.write_text("1\n" if enabled else "0\n", encoding="utf-8")
 
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -179,6 +208,23 @@ def get_project_info(cwd: str | None) -> ProjectInfo | None:
     for project in list_projects():
         if project.cwd == cwd:
             return project
+    return None
+
+
+def get_fallback_project(current_cwd: str | None, projects: list[ProjectInfo]) -> ProjectInfo | None:
+    if not projects:
+        return None
+
+    default_cwd = get_default_selected_project()
+    if default_cwd and default_cwd != current_cwd:
+        for project in projects:
+            if project.cwd == default_cwd:
+                return project
+
+    for project in projects:
+        if project.cwd != current_cwd:
+            return project
+
     return None
 
 
@@ -381,7 +427,12 @@ def infer_state(project: ProjectInfo | None) -> StateSnapshot:
     if latest_approval > latest_approval_decision:
         return StateSnapshot("approval", "Waiting for confirmation", project.updated_at_ms)
 
-    if latest_event_type == "response.completed" and latest_event_id >= max(latest_approval, latest_tool, latest_stream_toolcall_id, latest_stalled):
+    latest_completed_is_stable = (
+        latest_event_type == "response.completed"
+        and latest_event_id >= max(latest_approval, latest_tool, latest_stream_toolcall_id, latest_stalled)
+        and age_ms >= COMPLETION_SETTLE_MS
+    )
+    if latest_completed_is_stable:
         return StateSnapshot("done", "Development complete", project.updated_at_ms)
 
     thinking_events = {
@@ -555,10 +606,14 @@ class TrafficLightApp(rumps.App):
         self.state = "done"
         self.animation_step = 0
         self.selected_cwd = get_selected_project()
+        self.auto_switch_enabled = get_auto_switch_enabled()
+        self.done_since_ts: float | None = None
         self.last_projects: list[str] = []
         self.last_menu_build_time = 0.0
         self.notify_config = load_config_value().get("notify", [])
         self.project_lookup: dict[str, ProjectInfo] = {}
+        self.approval_sound_started_at: float | None = None
+        self.last_approval_sound_at: float | None = None
 
         rumps.Timer(self.check_state, POLL_INTERVAL).start()
         rumps.Timer(self.blink, BLINK_INTERVAL).start()
@@ -601,6 +656,12 @@ class TrafficLightApp(rumps.App):
             self.menu.add(rumps.MenuItem(f"  Task: {current.title[:60]}"))
         self.menu.add(rumps.MenuItem(f"  State: {snapshot.reason}"))
 
+        self.menu.add(rumps.separator)
+        auto_switch_state = "On" if self.auto_switch_enabled else "Off"
+        auto_switch_item = rumps.MenuItem(f"Auto-switch when done: {auto_switch_state}")
+        auto_switch_item.set_callback(self._on_toggle_auto_switch)
+        self.menu.add(auto_switch_item)
+
         if self.notify_config:
             self.menu.add(rumps.separator)
             self.menu.add(rumps.MenuItem("Codex Notify", callback=None))
@@ -622,21 +683,133 @@ class TrafficLightApp(rumps.App):
             if sender.title == project.label:
                 self.selected_cwd = project.cwd
                 set_selected_project(project.cwd)
+                self.done_since_ts = None
                 self.state = "done"
                 self.animation_step = 0
                 self._build_menu()
                 self.update_display()
                 return
 
+    def _on_toggle_auto_switch(self, sender: rumps.MenuItem) -> None:
+        self.auto_switch_enabled = not self.auto_switch_enabled
+        set_auto_switch_enabled(self.auto_switch_enabled)
+        if not self.auto_switch_enabled:
+            self.done_since_ts = None
+        self._build_menu()
+
+    def _switch_to_project(self, project: ProjectInfo) -> None:
+        self.selected_cwd = project.cwd
+        set_selected_project(project.cwd)
+        self.done_since_ts = None
+        self.state = "done"
+        self.animation_step = 0
+
+    def _play_sound(self, sound_path: Path) -> None:
+        try:
+            subprocess.Popen(
+                ["afplay", "--volume", str(SOUND_VOLUME), str(sound_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            try:
+                NSBeep()
+            except Exception:
+                pass
+
+    def _play_approval_sound(self) -> None:
+        self._play_sound(APPROVAL_SOUND_PATH)
+
+    def _play_done_sound(self) -> None:
+        self._play_sound(DONE_SOUND_PATH)
+
+    def _reset_approval_sound(self) -> None:
+        self.approval_sound_started_at = None
+        self.last_approval_sound_at = None
+
+    def _maybe_play_approval_sound(self, now: float) -> None:
+        if self.approval_sound_started_at is None:
+            self.approval_sound_started_at = now
+            self.last_approval_sound_at = now
+            self._play_approval_sound()
+            return
+
+        if now - self.approval_sound_started_at >= APPROVAL_SOUND_WINDOW_SECONDS:
+            return
+
+        if (
+            self.last_approval_sound_at is None
+            or now - self.last_approval_sound_at >= APPROVAL_SOUND_INTERVAL_SECONDS
+        ):
+            self.last_approval_sound_at = now
+            self._play_approval_sound()
+
+    def _maybe_auto_switch(
+        self,
+        current: ProjectInfo | None,
+        snapshot: StateSnapshot,
+        projects: list[ProjectInfo],
+    ) -> tuple[ProjectInfo | None, StateSnapshot]:
+        if not self.auto_switch_enabled or current is None:
+            self.done_since_ts = None
+            return current, snapshot
+
+        if snapshot.state != "done":
+            self.done_since_ts = None
+            return current, snapshot
+
+        now = time.time()
+        if self.done_since_ts is None:
+            self.done_since_ts = now
+            return current, snapshot
+
+        if now - self.done_since_ts < AUTO_SWITCH_DONE_SECONDS:
+            return current, snapshot
+
+        for project in projects:
+            if project.cwd == current.cwd:
+                continue
+            if not is_today_local(project.updated_at_ms):
+                continue
+            candidate_snapshot = infer_state(project)
+            if candidate_snapshot.state != "done":
+                self._switch_to_project(project)
+                return project, candidate_snapshot
+
+        fallback_project = get_fallback_project(current.cwd, projects)
+        if fallback_project is not None:
+            fallback_snapshot = infer_state(fallback_project)
+            self._switch_to_project(fallback_project)
+            return fallback_project, fallback_snapshot
+
+        return current, snapshot
+
     def check_state(self, _sender) -> None:
-        current = get_project_info(self.selected_cwd)
+        projects = list_projects()
+        self.project_lookup = {project.cwd: project for project in projects}
+        if projects and self.selected_cwd not in self.project_lookup:
+            self.selected_cwd = projects[0].cwd
+            set_selected_project(self.selected_cwd)
+            self.done_since_ts = None
+
+        current = self.project_lookup.get(self.selected_cwd or "")
         snapshot = infer_state(current)
+        current, snapshot = self._maybe_auto_switch(current, snapshot, projects)
+        now = time.time()
+
         if snapshot.state != self.state:
+            if snapshot.state == "done":
+                self._play_done_sound()
+            if snapshot.state != "approval":
+                self._reset_approval_sound()
             self.state = snapshot.state
             self.animation_step = 0
 
-        now = time.time()
-        projects = list_projects()
+        if snapshot.state == "approval":
+            self._maybe_play_approval_sound(now)
+        else:
+            self._reset_approval_sound()
+
         project_paths = [project.cwd for project in projects]
         if (
             project_paths != self.last_projects
